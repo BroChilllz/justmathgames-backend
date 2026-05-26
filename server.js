@@ -23,7 +23,15 @@ const userSchema = new mongoose.Schema({
   userId:    { type: String, required: true, unique: true, index: true },
   username:  { type: String, unique: true, sparse: true },
   password:  { type: String },
+  bio:       { type: String, default: '' },
+  pfp:       { type: String, default: '' },
+  presenceStatus: { type: String, enum: ['online', 'offline'], default: 'offline' },
+  activity:  { type: String, default: '' },
+  lastSeen:  { type: Date, default: Date.now },
   favorites: { type: [String], default: [] },
+  favoriteItems: { type: [String], default: [] },
+  contentVotes:  { type: Object, default: {} },
+  contentStats:  { type: Object, default: {} },
   settings:  { type: Object, default: {} },
   gameSaves: { type: Object, default: {} },
   idbSaves:  { type: Object, default: {} },
@@ -69,12 +77,21 @@ const groupMessageSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+const contentVoteSchema = new mongoose.Schema({
+  userId:     { type: String, required: true, index: true },
+  contentKey: { type: String, required: true, index: true },
+  vote:       { type: String, enum: ['like', 'dislike'], required: true },
+  updatedAt:  { type: Date, default: Date.now }
+});
+contentVoteSchema.index({ userId: 1, contentKey: 1 }, { unique: true });
+
 const User         = mongoose.model('User', userSchema);
 const Message      = mongoose.model('Message', messageSchema);
 const FriendRequest = mongoose.model('FriendRequest', friendRequestSchema);
 const DmMessage    = mongoose.model('DmMessage', dmMessageSchema);
 const Group        = mongoose.model('Group', groupSchema);
 const GroupMessage = mongoose.model('GroupMessage', groupMessageSchema);
+const ContentVote  = mongoose.model('ContentVote', contentVoteSchema);
 
 // ================================================================
 // HELPERS
@@ -84,17 +101,176 @@ function dmConversationId(a, b) {
   return [a, b].sort().join(':');
 }
 
+function isValidUsername(username) {
+  return typeof username === 'string' &&
+    username.length >= 3 &&
+    username.length <= 20 &&
+    /^[a-zA-Z0-9_]+$/.test(username);
+}
+
+function normalizeBio(value) {
+  return String(value || '').trim().slice(0, 220);
+}
+
+function normalizePfp(value) {
+  const pfp = String(value || '').trim();
+  if (!pfp) return '';
+  if (pfp.length > 500) return null;
+  try {
+    const parsed = new URL(pfp);
+    return ['http:', 'https:'].includes(parsed.protocol) ? pfp : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeStringArray(value, maxItems = 500) {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(
+    value
+      .map(item => String(item || '').trim())
+      .filter(Boolean)
+      .slice(0, maxItems)
+  ));
+}
+
+function normalizeContentVoteMap(value) {
+  const result = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+  for (const [key, vote] of Object.entries(value)) {
+    if (typeof key !== 'string' || key.length > 500) continue;
+    if (vote === 'like' || vote === 'dislike') result[key] = vote;
+  }
+  return result;
+}
+
+function normalizeContentStatsMap(value) {
+  const result = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return result;
+  for (const [key, stats] of Object.entries(value)) {
+    if (typeof key !== 'string' || key.length > 500) continue;
+    result[key] = {
+      likes: Math.max(0, Number(stats?.likes) || 0),
+      dislikes: Math.max(0, Number(stats?.dislikes) || 0)
+    };
+  }
+  return result;
+}
+
+function publicProfile(user) {
+  const lastSeenTime = user.lastSeen ? new Date(user.lastSeen).getTime() : 0;
+  const online = Date.now() - lastSeenTime < 45 * 1000 && user.presenceStatus !== 'offline';
+  const activity = online ? (user.activity || '') : '';
+  return {
+    username: user.username,
+    bio: user.bio || '',
+    pfp: user.pfp || '',
+    avatar: user.pfp || '',
+    avatarUrl: user.pfp || '',
+    online,
+    statusClass: activity ? 'playing' : online ? 'online' : 'offline',
+    statusText: activity || (online ? 'Online' : 'Offline'),
+    activity,
+    lastSeen: user.lastSeen
+  };
+}
+
+function userDataResponse(user) {
+  return {
+    userId: user?.userId || '',
+    username: user?.username || '',
+    bio: user?.bio || '',
+    pfp: user?.pfp || '',
+    online: user ? publicProfile(user).online : false,
+    statusClass: user ? publicProfile(user).statusClass : 'offline',
+    statusText: user ? publicProfile(user).statusText : 'Offline',
+    activity: user?.activity || '',
+    lastSeen: user?.lastSeen,
+    favorites: user?.favorites || [],
+    favoriteItems: user?.favoriteItems || [],
+    contentVotes: user?.contentVotes || {},
+    contentStats: user?.contentStats || {},
+    settings: user?.settings || {},
+    gameSaves: user?.gameSaves || {},
+    idbSaves: user?.idbSaves || {},
+    updatedAt: user?.updatedAt
+  };
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function cascadeUsernameChange(oldUsername, newUsername) {
+  if (!oldUsername || oldUsername === newUsername) return;
+
+  await Promise.all([
+    Message.updateMany({ username: oldUsername }, { $set: { username: newUsername } }),
+    FriendRequest.updateMany({ from: oldUsername }, { $set: { from: newUsername } }),
+    FriendRequest.updateMany({ to: oldUsername }, { $set: { to: newUsername } }),
+    Group.updateMany({ owner: oldUsername }, { $set: { owner: newUsername } }),
+    Group.updateMany({ members: oldUsername }, { $set: { 'members.$': newUsername } }),
+    GroupMessage.updateMany({ from: oldUsername }, { $set: { from: newUsername } })
+  ]);
+
+  const dmNamePattern = new RegExp(`(^|:)${escapeRegExp(oldUsername)}(:|$)`);
+  const dmMessages = await DmMessage.find({ conversationId: dmNamePattern });
+  for (const message of dmMessages) {
+    const participants = message.conversationId
+      .split(':')
+      .map(name => name === oldUsername ? newUsername : name);
+    if (participants.length === 2) {
+      message.conversationId = dmConversationId(participants[0], participants[1]);
+    }
+    if (message.from === oldUsername) message.from = newUsername;
+    await message.save();
+  }
+}
+
+async function getContentStats(contentKey) {
+  const match = contentKey ? { contentKey } : {};
+  const rows = await ContentVote.aggregate([
+    { $match: match },
+    {
+      $group: {
+        _id: '$contentKey',
+        likes: { $sum: { $cond: [{ $eq: ['$vote', 'like'] }, 1, 0] } },
+        dislikes: { $sum: { $cond: [{ $eq: ['$vote', 'dislike'] }, 1, 0] } }
+      }
+    }
+  ]);
+
+  const stats = {};
+  for (const row of rows) {
+    stats[row._id] = { likes: row.likes || 0, dislikes: row.dislikes || 0 };
+  }
+
+  if (contentKey) return stats[contentKey] || { likes: 0, dislikes: 0 };
+  return stats;
+}
+
+async function getContentVotesForUser(userId) {
+  const votes = await ContentVote.find({ userId }).lean();
+  return votes.reduce((result, item) => {
+    result[item.contentKey] = item.vote;
+    return result;
+  }, {});
+}
+
 // ================================================================
 // AUTH MIDDLEWARE
 // ================================================================
 
-function authMiddleware(req, res, next) {
+async function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token' });
   try {
-    req.user = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET);
+    const user = await User.findOne({ userId: payload.userId });
+    if (!user || !user.username) return res.status(401).json({ error: 'Invalid token' });
+    req.user = { userId: user.userId, username: user.username };
     next();
-  } catch {
+  } catch (err) {
     res.status(401).json({ error: 'Invalid token' });
   }
 }
@@ -107,10 +283,8 @@ app.post('/auth/register', async (req, res) => {
   const { username, password, userId } = req.body;
   if (!username || !password || !userId)
     return res.status(400).json({ error: 'username, password, and userId required' });
-  if (username.length < 3 || username.length > 20)
-    return res.status(400).json({ error: 'Username must be 3-20 characters' });
-  if (!/^[a-zA-Z0-9_]+$/.test(username))
-    return res.status(400).json({ error: 'Username can only contain letters, numbers, underscores' });
+  if (!isValidUsername(username))
+    return res.status(400).json({ error: 'Username must be 3-20 letters, numbers, or underscores' });
   if (password.length < 6)
     return res.status(400).json({ error: 'Password must be at least 6 characters' });
   try {
@@ -123,7 +297,7 @@ app.post('/auth/register', async (req, res) => {
       { upsert: true, new: true }
     );
     const token = jwt.sign({ userId, username }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ ok: true, token, username });
+    res.json({ ok: true, token, username, userId, bio: '', pfp: '' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -148,8 +322,91 @@ app.post('/auth/login', async (req, res) => {
 });
 
 app.get('/auth/check/:username', async (req, res) => {
+  if (!isValidUsername(req.params.username))
+    return res.json({ available: false });
   const user = await User.findOne({ username: req.params.username });
   res.json({ available: !user });
+});
+
+// ================================================================
+// PROFILE ROUTES
+// ================================================================
+
+app.get('/profile/:username', async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.params.username });
+    if (!user) return res.status(404).json({ error: 'Profile not found' });
+    res.json(publicProfile(user));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/profile', authMiddleware, async (req, res) => {
+  const nextUsername = String(req.body.username || req.user.username).trim();
+  const hasBio = Object.prototype.hasOwnProperty.call(req.body, 'bio');
+  const hasPfp = Object.prototype.hasOwnProperty.call(req.body, 'pfp');
+  const nextBio = hasBio ? normalizeBio(req.body.bio) : '';
+  const nextPfp = hasPfp ? normalizePfp(req.body.pfp) : '';
+  const nextPassword = req.body.password ? String(req.body.password) : '';
+
+  if (!isValidUsername(nextUsername))
+    return res.status(400).json({ error: 'Username must be 3-20 letters, numbers, or underscores' });
+  if (hasPfp && nextPfp === null)
+    return res.status(400).json({ error: 'PFP must be a valid http or https URL under 500 characters' });
+  if (nextPassword && nextPassword.length < 6)
+    return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+  try {
+    const user = await User.findOne({ userId: req.user.userId });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    if (nextUsername !== user.username) {
+      const existing = await User.findOne({ username: nextUsername, _id: { $ne: user._id } });
+      if (existing) return res.status(400).json({ error: 'Username already taken' });
+      await cascadeUsernameChange(user.username, nextUsername);
+      user.username = nextUsername;
+    }
+
+    if (hasBio) user.bio = nextBio;
+    if (hasPfp) user.pfp = nextPfp || '';
+    if (nextPassword) user.password = await bcrypt.hash(nextPassword, 10);
+    user.updatedAt = new Date();
+    await user.save();
+
+    const token = jwt.sign({ userId: user.userId, username: user.username }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ ok: true, token, userId: user.userId, ...publicProfile(user) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// PRESENCE ROUTES
+// ================================================================
+
+app.post('/presence', authMiddleware, async (req, res) => {
+  const status = req.body.status === 'offline' ? 'offline' : 'online';
+  const activity = status === 'online'
+    ? String(req.body.activity || '').trim().slice(0, 80)
+    : '';
+
+  try {
+    await User.findOneAndUpdate(
+      { userId: req.user.userId },
+      {
+        $set: {
+          presenceStatus: status,
+          activity,
+          lastSeen: new Date(),
+          updatedAt: new Date()
+        }
+      }
+    );
+    res.json({ ok: true, status, activity });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ================================================================
@@ -159,8 +416,8 @@ app.get('/auth/check/:username', async (req, res) => {
 app.get('/user/:id', async (req, res) => {
   try {
     const user = await User.findOne({ userId: req.params.id });
-    if (!user) return res.json({ favorites: [], settings: {}, gameSaves: {}, idbSaves: {} });
-    res.json(user);
+    if (!user) return res.json(userDataResponse(null));
+    res.json(userDataResponse(user));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -170,7 +427,16 @@ app.post('/user/:id', async (req, res) => {
   try {
     const existing = await User.findOne({ userId: req.params.id });
     const update = { updatedAt: new Date() };
-    if (req.body.favorites !== undefined) update.favorites = req.body.favorites;
+    if (req.body.favorites !== undefined) update.favorites = normalizeStringArray(req.body.favorites);
+    if (req.body.favoriteItems !== undefined) update.favoriteItems = normalizeStringArray(req.body.favoriteItems);
+    if (req.body.contentVotes !== undefined) update.contentVotes = normalizeContentVoteMap(req.body.contentVotes);
+    if (req.body.contentStats !== undefined) update.contentStats = normalizeContentStatsMap(req.body.contentStats);
+    if (req.body.bio !== undefined) update.bio = normalizeBio(req.body.bio);
+    if (req.body.pfp !== undefined) {
+      const pfp = normalizePfp(req.body.pfp);
+      if (pfp === null) return res.status(400).json({ error: 'PFP must be a valid http or https URL under 500 characters' });
+      update.pfp = pfp;
+    }
     if (req.body.settings  !== undefined) update.settings  = req.body.settings;
     if (req.body.gameSaves) {
       update.gameSaves = { ...(existing?.gameSaves || {}), ...req.body.gameSaves };
@@ -201,6 +467,83 @@ app.delete('/user/:id/save/:game', async (req, res) => {
       { $unset: { [`gameSaves.${req.params.game}`]: '' } }
     );
     res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// CONTENT FAVORITES / VOTING ROUTES
+// ================================================================
+
+app.get('/content/stats', async (req, res) => {
+  try {
+    res.json({ stats: await getContentStats() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/content/votes/:userId', async (req, res) => {
+  try {
+    res.json({ votes: await getContentVotesForUser(req.params.userId) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/content/state/:userId', async (req, res) => {
+  try {
+    const [stats, votes] = await Promise.all([
+      getContentStats(),
+      getContentVotesForUser(req.params.userId)
+    ]);
+    res.json({ stats, votes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/content/vote/:userId', async (req, res) => {
+  const userId = String(req.params.userId || '').trim();
+  const contentKey = String(req.body.contentKey || '').trim();
+  const vote = String(req.body.vote || '').trim();
+
+  if (!userId || userId.length > 120)
+    return res.status(400).json({ error: 'Valid userId required' });
+  if (!contentKey || contentKey.length > 500)
+    return res.status(400).json({ error: 'Valid contentKey required' });
+  if (vote && !['like', 'dislike'].includes(vote))
+    return res.status(400).json({ error: 'Vote must be like, dislike, or empty' });
+
+  try {
+    if (vote) {
+      await ContentVote.findOneAndUpdate(
+        { userId, contentKey },
+        { $set: { vote, updatedAt: new Date() } },
+        { upsert: true, new: true }
+      );
+    } else {
+      await ContentVote.deleteOne({ userId, contentKey });
+    }
+
+    const [stats, votes] = await Promise.all([
+      getContentStats(contentKey),
+      getContentVotesForUser(userId)
+    ]);
+
+    await User.findOneAndUpdate(
+      { userId },
+      {
+        $set: {
+          contentVotes: votes,
+          updatedAt: new Date()
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.json({ ok: true, vote, contentKey, stats, votes });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -338,7 +681,14 @@ app.get('/friends', authMiddleware, async (req, res) => {
       }
     }
 
-    res.json({ friends, incoming, outgoing });
+    const usernames = Array.from(new Set([me, ...friends, ...incoming, ...outgoing]));
+    const users = await User.find({ username: { $in: usernames } }).lean();
+    const profiles = {};
+    for (const user of users) {
+      profiles[user.username] = publicProfile(user);
+    }
+
+    res.json({ friends, incoming, outgoing, profiles });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
