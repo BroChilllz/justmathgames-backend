@@ -978,6 +978,33 @@ app.delete('/groups/:id/messages/:msgId', authMiddleware, async (req, res) => {
   }
 });
 
+const { AccessToken } = require('livekit-server-sdk');
+
+// Generate a token to join a VC room
+app.post('/vc/token', authMiddleware, async (req, res) => {
+  const { room } = req.body;
+  if (!room || typeof room !== 'string' || room.length > 100)
+    return res.status(400).json({ error: 'Valid room name required' });
+
+  try {
+    const token = new AccessToken(
+      process.env.LK_API_KEY,
+      process.env.LK_API_SECRET,
+      { identity: req.user.username, ttl: '4h' }
+    );
+    token.addGrant({
+      roomJoin: true,
+      room,
+      canPublish: true,
+      canSubscribe: true,
+      canPublishSources: ['microphone', 'screen_share', 'screen_share_audio']
+    });
+    res.json({ token: await token.toJwt(), url: process.env.LK_URL });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 
 app.get('/', (req, res) => res.send('JustMathGames API running'));
