@@ -1005,6 +1005,64 @@ app.post('/vc/token', authMiddleware, async (req, res) => {
   }
 });
 
+// Active calls: roomId -> { caller, roomId, startedAt }
+// Use a simple in-memory map (resets on server restart, fine for calls)
+const activeCalls = new Map();
+
+// Start/announce a call
+app.post('/vc/call', authMiddleware, async (req, res) => {
+  const { room } = req.body;
+  if (!room) return res.status(400).json({ error: 'room required' });
+  activeCalls.set(room, {
+    caller: req.user.username,
+    room,
+    startedAt: Date.now()
+  });
+  // Auto-expire after 60 seconds if nobody answers
+  setTimeout(() => {
+    const call = activeCalls.get(room);
+    if (call && call.caller === req.user.username) activeCalls.delete(room);
+  }, 60000);
+  res.json({ ok: true });
+});
+
+// End/cancel a call
+app.delete('/vc/call/:room', authMiddleware, (req, res) => {
+  activeCalls.delete(decodeURIComponent(req.params.room));
+  res.json({ ok: true });
+});
+
+// Get active calls for rooms this user is part of
+app.get('/vc/calls', authMiddleware, async (req, res) => {
+  const me = req.user.username;
+  try {
+    // Get user's DM friends and groups to know which rooms to check
+    const [friendData, groups] = await Promise.all([
+      FriendRequest.find({ $or: [{ from: me }, { to: me }], status: 'accepted' }).lean(),
+      Group.find({ members: me }).lean()
+    ]);
+
+    const relevantRooms = new Set();
+    for (const f of friendData) {
+      const other = f.from === me ? f.to : f.from;
+      relevantRooms.add('dm:' + [me, other].sort().join(':'));
+    }
+    for (const g of groups) {
+      relevantRooms.add('group:' + g._id);
+    }
+
+    const incoming = [];
+    for (const [room, call] of activeCalls) {
+      if (relevantRooms.has(room) && call.caller !== me) {
+        incoming.push(call);
+      }
+    }
+    res.json({ calls: incoming });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 
 app.get('/', (req, res) => res.send('JustMathGames API running'));
