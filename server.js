@@ -266,9 +266,10 @@ async function authMiddleware(req, res, next) {
   if (!token) return res.status(401).json({ error: 'No token' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const user = await User.findOne({ userId: payload.userId });
-    if (!user || !user.username) return res.status(401).json({ error: 'Invalid token' });
-    req.user = { userId: user.userId, username: user.username };
+    // Trust the JWT — no DB call needed just to authenticate
+    if (!payload.userId || !payload.username)
+      return res.status(401).json({ error: 'Invalid token' });
+    req.user = { userId: payload.userId, username: payload.username };
     next();
   } catch (err) {
     res.status(401).json({ error: 'Invalid token' });
@@ -499,6 +500,59 @@ app.get('/content/state/:userId', async (req, res) => {
       getContentVotesForUser(req.params.userId)
     ]);
     res.json({ stats, votes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/social/summary', authMiddleware, async (req, res) => {
+  const me = req.user.username;
+  try {
+    const [friendData, groups, globalMsgs] = await Promise.all([
+      FriendRequest.find({ $or: [{ from: me }, { to: me }] }).lean(),
+      Group.find({ members: me }).lean(),
+      Message.find().sort({ createdAt: -1 }).limit(1).lean()
+    ]);
+
+    const friends = [];
+    const incoming = [];
+    const outgoing = [];
+    for (const r of friendData) {
+      if (r.status === 'accepted') friends.push(r.from === me ? r.to : r.from);
+      else if (r.status === 'pending') {
+        if (r.to === me) incoming.push(r.from);
+        if (r.from === me) outgoing.push(r.to);
+      }
+    }
+
+    const friendsSlice = friends.slice(0, 8);
+    const groupsSlice  = groups.slice(0, 4);
+
+    // All last-message lookups in parallel
+    const [dmResults, groupMsgResults, profiles] = await Promise.all([
+      Promise.all(friendsSlice.map(u =>
+        DmMessage.findOne({ conversationId: dmConversationId(me, u) })
+          .sort({ createdAt: -1 }).lean()
+      )),
+      Promise.all(groupsSlice.map(g =>
+        GroupMessage.findOne({ groupId: g._id })
+          .sort({ createdAt: -1 }).lean()
+      )),
+      User.find({ username: { $in: friendsSlice } })
+        .select('username pfp presenceStatus activity lastSeen').lean()
+    ]);
+
+    const profileMap = {};
+    for (const u of profiles) profileMap[u.username] = publicProfile(u);
+
+    res.json({
+      friends, incoming, outgoing,
+      profiles: profileMap,
+      groups: groupsSlice,
+      dmLastMessages: Object.fromEntries(friendsSlice.map((u, i) => [u, dmResults[i]])),
+      groupLastMessages: Object.fromEntries(groupsSlice.map((g, i) => [String(g._id), groupMsgResults[i]])),
+      globalLastMessage: globalMsgs[0] || null
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
